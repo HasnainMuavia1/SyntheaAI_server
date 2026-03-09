@@ -1,0 +1,1 @@
+{"copy_file": ["source_path", "destination_path"], "file_delete": ["file_path"], "file_search": ["dir_path", "pattern"], "move_file": ["source_path", "destination_path"], "read_file": ["file_path"], "write_file": ["file_path", "text", "append"], "list_directory": ["dir_path"]}
