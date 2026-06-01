@@ -1,0 +1,42 @@
+# Synthea backend — Django (Channels/Daphne) served via ASGI.
+#
+#   docker compose up --build        (run from SyntheaAI_server/)
+#
+# Health check:  http://localhost:8000/api/
+#
+# Shares the external "synthea-net" network so the frontend (its own compose
+# project) can reach this container as "synthea-backend". Create it once with:
+#   docker network create synthea-net
+
+services:
+  backend:
+    build:
+      context: .
+    image: synthea-backend
+    container_name: synthea-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: core.settings
+      # Optional: needed only when the LangChain agent is actually invoked.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+    volumes:
+      # Persist the SQLite DB and generated user workspaces across restarts.
+      - ./db.sqlite3:/app/db.sqlite3
+      # Bind-mount the existing workspaces tree (sibling of this compose file) to
+      # the path the app resolves to inside the container: BASE_DIR(/app)/../workspaces
+      # => /workspaces. This keeps already-created user projects visible.
+      - ../workspaces:/workspaces
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - synthea-net
+    restart: unless-stopped
+
+networks:
+  synthea-net:
+    external: true

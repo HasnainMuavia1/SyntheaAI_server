@@ -2,7 +2,16 @@ import os
 import json
 import asyncio
 from channels.generic.websocket import AsyncWebsocketConsumer
-from winpty import PTY
+# winpty (pywinpty) is a Windows-only dependency used to spawn a PowerShell PTY.
+# It is unavailable on Linux/macOS (e.g. inside a Docker container), so we import
+# it lazily/defensively. The rest of the app (API + other websockets) must still
+# boot when it is missing; only the terminal feature degrades gracefully.
+try:
+    from winpty import PTY  # type: ignore
+    WINPTY_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    PTY = None  # type: ignore
+    WINPTY_AVAILABLE = False
 from asgiref.sync import sync_to_async
 from urllib.parse import parse_qs
 from urllib.parse import parse_qs
@@ -18,7 +27,17 @@ class TerminalConsumer(AsyncWebsocketConsumer):
         print("Terminal WebSocket connecting...")
         await self.accept()
         print("Terminal WebSocket accepted.")
-        
+
+        # The interactive terminal relies on winpty (Windows-only). When it is not
+        # available (e.g. running inside a Linux container) we report it instead of
+        # crashing the websocket connection.
+        if not WINPTY_AVAILABLE:
+            await self.send(text_data=json.dumps({
+                'error': 'Terminal feature is unavailable on this platform (requires Windows/winpty).'
+            }))
+            await self.close()
+            return
+
         # Start a PowerShell/Cmd PTY
         try:
             query = parse_qs(self.scope.get("query_string", b"").decode())
@@ -123,7 +142,7 @@ class VoiceConsumer(AsyncWebsocketConsumer):
         try:
             import whisperflow.streaming as st
             import whisperflow.transcriber as ts
-            self.model = ts.get_model('tiny.en') 
+            self.model = ts.get_model('tiny.en.pt') 
         except (ImportError, ModuleNotFoundError) as e:
             print(f"WhisperFlow not installed or missing: {e}")
             await self.send(text_data=json.dumps({'error': 'Voice features currently unavailable (missing backend dependencies).'}))

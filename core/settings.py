@@ -149,3 +149,8 @@ SIMPLE_JWT = {
 
 # CORS configuration
 CORS_ALLOW_ALL_ORIGINS = True # Allow Next.js frontend to access
+
+# Ensure workspaces directory exists at startup (works both locally and in Docker)
+import os
+WORKSPACES_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'workspaces'))
+os.makedirs(WORKSPACES_DIR, exist_ok=True)

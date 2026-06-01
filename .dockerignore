@@ -1,0 +1,15 @@
+.git
+.gitignore
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.env
+.env.local
+*.log
+schema.txt
+schema2.json
+# Keep db.sqlite3 out of the image; it is provided via a volume in compose.
+db.sqlite3

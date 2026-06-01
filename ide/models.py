@@ -21,20 +21,20 @@ class Workspace(models.Model):
         return f"{self.name} ({self.user.username})"
 
     def get_absolute_path(self):
-        # Determine the base path for workspaces, e.g., in a 'workspaces' folder at project root
+        # Always derive the path from the current project root so workspaces stay
+        # portable across environments (host dev vs. Docker, Windows vs. Linux).
+        # A stored directory_path from another machine (e.g. an old "C:\..." value)
+        # must never leak through, so we recompute rather than trust the column.
         base_dir = os.path.join(settings.BASE_DIR, '..', 'workspaces')
-        if not self.directory_path:
-            self.directory_path = os.path.join(base_dir, str(self.user.id), str(self.workspace_id))
-        return os.path.abspath(self.directory_path)
+        return os.path.abspath(os.path.join(base_dir, str(self.user.id), str(self.workspace_id)))
 
     def save(self, *args, **kwargs):
-        if not self.directory_path:
-            self.directory_path = self.get_absolute_path()
+        # Normalize the stored path to the current environment on every save.
+        self.directory_path = self.get_absolute_path()
         super().save(*args, **kwargs)
-        
+
         # Ensure directory exists on disk
-        if not os.path.exists(self.directory_path):
-            os.makedirs(self.directory_path, exist_ok=True)
+        os.makedirs(self.directory_path, exist_ok=True)
 
 class ChatSession(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
