@@ -59,6 +59,8 @@ class ChatMessage(models.Model):
     project = models.ForeignKey(Workspace, on_delete=models.CASCADE, related_name='all_messages', null=True, blank=True) # Kept for backward compatibility momentarily
     sender = models.CharField(max_length=10, choices=SENDER_CHOICES)
     text = models.TextField()
+    reasoning = models.TextField(blank=True, null=True)   # Agent thought-stream logs
+    files_created = models.TextField(blank=True, null=True)  # JSON list of modified/created paths
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):

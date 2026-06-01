@@ -281,63 +281,68 @@ from dotenv import load_dotenv
 BASE_DIR_ENV = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv(os.path.join(BASE_DIR_ENV, ".env.local"))
 
+
+# ---------------------------------------------------------------------------
+# Path sanitization helpers
+# ---------------------------------------------------------------------------
+
+def _sanitize_single_path(raw: str, work_dir: str) -> str:
+    """Convert any path (absolute or relative) to a safe relative path inside work_dir."""
+    # Normalise Windows back-slashes to forward slashes
+    raw = raw.replace('\\', '/')
+    # Strip any leading drive letters (Windows style, e.g. C:/)
+    if len(raw) >= 2 and raw[1] == ':':
+        raw = raw[2:]
+    # Strip leading slashes
+    raw = raw.lstrip('/')
+    
+    # If the path starts with work_dir path itself, strip it so it becomes relative
+    work_dir_clean = work_dir.replace('\\', '/').lstrip('/')
+    if raw.startswith(work_dir_clean):
+        raw = raw[len(work_dir_clean):].lstrip('/')
+        
+    # Prevent path traversal: resolve and compare
+    abs_candidate = os.path.normpath(os.path.join(work_dir, raw))
+    work_dir_norm = os.path.normpath(work_dir)
+    if not abs_candidate.startswith(work_dir_norm):
+        # Fall back to just the basename if the path tries to escape
+        raw = os.path.basename(raw)
+    return raw
+
+
+def _sanitize_tool_input(tool_input, work_dir: str):
+    """Recursively sanitize all path-like keys in a tool input dict/string."""
+    PATH_KEYS = {'file_path', 'source_path', 'destination_path', 'dir_path', 'path'}
+    if isinstance(tool_input, str):
+        return _sanitize_single_path(tool_input, work_dir)
+    if isinstance(tool_input, dict):
+        for key in list(tool_input.keys()):
+            if key in PATH_KEYS and isinstance(tool_input[key], str):
+                tool_input[key] = _sanitize_single_path(tool_input[key], work_dir)
+    return tool_input
+
+
+# ---------------------------------------------------------------------------
+# Callback handler
+# ---------------------------------------------------------------------------
+
 class AgentCallbackHandler(AsyncCallbackHandler):
     def __init__(self, consumer):
         self.consumer = consumer
-        self.last_path = None
 
     async def on_agent_action(self, action, **kwargs):
         """Run on agent action."""
-        # Monitor all file-modifying tools
-        modification_tools = ["write_file", "move_file", "copy_file", "file_delete", "create_directory", "delete_file"]
-        if action.tool in modification_tools:
-            try:
-                tool_input = action.tool_input
-                file_path = None
-                
-                # Extract dictionary if tool_input is a JSON string
-                if isinstance(tool_input, str):
-                    try:
-                        import json
-                        tool_input = json.loads(tool_input)
-                    except:
-                        pass # Fallback to using it as a string below if it wasn't JSON
-                        
-                if isinstance(tool_input, dict):
-                    # For move_file / copy_file, the affected destination is destination_path
-                    if action.tool in ["move_file", "copy_file"]:
-                        file_path = tool_input.get("destination_path")
-                    # For write_file, file_delete
-                    elif action.tool in ["write_file", "file_delete", "delete_file"]: 
-                        file_path = tool_input.get("file_path")
-                    # For directory operations if any exist
-                    elif action.tool == "create_directory":
-                        file_path = tool_input.get("dir_path")
-                        
-                    # Catch-all
-                    if not file_path:
-                        file_path = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("destination_path") or tool_input.get("dir_path")
-                elif isinstance(tool_input, str):
-                    file_path = tool_input
-                
-                if file_path:
-                    print(f"Agent modifying path: {file_path} via tool {action.tool}")
-                    self.last_path = file_path
-                    # Just store the path, send notification in on_tool_end
-            except Exception as e:
-                print(f"Error in on_agent_action path parsing: {e}")
-
-        # Send reasoning/thought to frontend
+        # Send reasoning/thought to frontend and accumulate
         thought = getattr(action, 'log', '')
         if thought:
             clean_thought = thought.strip()
-            # Remove standard LangChain Action JSON blocks
             if "```json" in clean_thought:
                 clean_thought = clean_thought.split("```json")[0].strip()
             if "Action:" in clean_thought:
                 clean_thought = clean_thought.split("Action:")[0].strip()
-            
+
             if clean_thought and not (clean_thought.startswith('{') and clean_thought.endswith('}')):
+                self.consumer.current_reasoning += clean_thought + "\n"
                 await self.consumer.send(text_data=json.dumps({
                     'type': 'reasoning',
                     'content': clean_thought + "\n"
@@ -345,22 +350,12 @@ class AgentCallbackHandler(AsyncCallbackHandler):
 
     async def on_tool_end(self, output, **kwargs):
         """Run when tool ends."""
-        # Notify frontend that a file was modified/created AFTER it's actually done
-        if self.last_path:
-            try:
-                await self.consumer.send(text_data=json.dumps({
-                    'type': 'file_event',
-                    'event': 'modified',
-                    'path': self.last_path
-                }))
-            except Exception as e:
-                print(f"Error sending file_event: {e}")
-            self.last_path = None
-
-        # Optionally send tool output as reasoning
+        # Accumulate tool output into reasoning log
+        tool_line = f"\nTool Output: {output}\n"
+        self.consumer.current_reasoning += tool_line
         await self.consumer.send(text_data=json.dumps({
             'type': 'reasoning',
-            'content': f"\nTool Output: {output}\n"
+            'content': tool_line
         }))
 
 
@@ -380,7 +375,8 @@ CODER_PROMPT = """You are a senior execution engineer. Execute the Planner's str
 CRITICAL RULES:
 1. TOOLS: Use ONLY the exact tools provided in your toolkit. NEVER hallucinate or attempt to use tools that do not exist (e.g., DO NOT use 'run_file').
 2. FILE WRITING: When using 'write_file', provide ONLY the raw, runnable code. NEVER wrap code in markdown blocks (```python) in tool inputs.
-3. NO CHAT: Be extremely direct. Zero conversational text."""
+3. FILE PATHS: Always use simple relative paths (e.g., 'index.html', 'src/utils.py'). Never use absolute paths or paths starting with '/'.
+4. NO CHAT: Be extremely direct. Zero conversational text."""
 
 REVIEWER_PROMPT = """You are a senior tech lead reviewing the work.
 Provide a final, EXTREMELY SHORT and concise summary to the user.
@@ -397,6 +393,9 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
         self.workspace_id = None
         self.session_id = None
         self.agent_task = None  # To hold the currently running agent task
+        self.work_dir = os.getcwd()   # Will be updated in connect()
+        self.current_reasoning = ''   # Accumulated thought log for current run
+        self.modified_files = set()   # Files created/modified in current run
 
     async def connect(self):
         print("LangChain Multi-Agent WebSocket connecting...")
@@ -404,17 +403,24 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
         
         try:
             query = parse_qs(self.scope.get("query_string", b"").decode())
+            print(f"WS Agent scope query: {query}")
             self.workspace_id = query.get("projectId", [None])[0]
             self.session_id = query.get("sessionId", [None])[0]
+            print(f"WS Agent parsed workspace_id={self.workspace_id}, session_id={self.session_id}")
             cwd = os.getcwd()
             if self.workspace_id:
                 try:
                     workspace = await sync_to_async(Workspace.objects.get)(workspace_id=self.workspace_id)
-                    cwd = workspace.get_absolute_path()
-                except: pass
+                    cwd = await sync_to_async(workspace.get_absolute_path)()
+                    print(f"WS Agent successfully retrieved workspace. cwd={cwd}")
+                except Exception as ex:
+                    print(f"WS Agent error retrieving workspace {self.workspace_id}: {ex}")
+                    import traceback
+                    traceback.print_exc()
 
             # Use forward slashes for cross-platform compatibility
-            work_dir = cwd.replace('\\', '/')
+            self.work_dir = cwd.replace('\\', '/')
+            print(f"WS Agent resolved work_dir={self.work_dir}")
 
             # Shared LLM Configuration
             self.llm = ChatGroq(
@@ -424,9 +430,87 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
                 reasoning_format="parsed",
             )
             
-            # File Management Toolkit
-            toolkit = FileManagementToolkit(root_dir=work_dir)
-            self.tools = toolkit.get_tools()
+            # File Management Toolkit — root_dir ensures all ops stay in workspace
+            toolkit = FileManagementToolkit(root_dir=self.work_dir)
+            base_tools = toolkit.get_tools()
+            self.tools = []
+
+            # Define a wrapper to sanitize inputs and track modified files
+            def wrap_tool(tool):
+                orig_run = tool._run
+                orig_arun = tool._arun
+
+                # Detect modification tools
+                is_mod_tool = tool.name in ["write_file", "move_file", "copy_file", "file_delete", "delete_file"]
+                is_delete_tool = tool.name in ["file_delete", "delete_file"]
+
+                def sanitize_and_track_inputs(*args, **kwargs):
+                    sanitized_args = []
+                    for arg in args:
+                        sanitized_args.append(_sanitize_tool_input(arg, self.work_dir))
+                    sanitized_kwargs = {}
+                    for k, v in kwargs.items():
+                        sanitized_kwargs[k] = _sanitize_tool_input(v, self.work_dir)
+                    
+                    file_path_clean = None
+                    # Track path for modified_files
+                    if is_mod_tool:
+                        file_path = None
+                        if sanitized_kwargs:
+                            if tool.name in ["move_file", "copy_file"]:
+                                file_path = sanitized_kwargs.get("destination_path")
+                            else:
+                                file_path = sanitized_kwargs.get("file_path") or sanitized_kwargs.get("path")
+                        elif sanitized_args and isinstance(sanitized_args[0], dict):
+                            inp = sanitized_args[0]
+                            if tool.name in ["move_file", "copy_file"]:
+                                file_path = inp.get("destination_path")
+                            else:
+                                file_path = inp.get("file_path") or inp.get("path")
+                        
+                        if file_path:
+                            file_path_clean = _sanitize_single_path(file_path, self.work_dir)
+                            print(f"Tool {tool.name} modifying path: {file_path_clean}")
+                            self.modified_files.add(file_path_clean)
+                    
+                    return sanitized_args, sanitized_kwargs, file_path_clean
+
+                def wrapped_run(*args, **kwargs):
+                    s_args, s_kwargs, file_path_clean = sanitize_and_track_inputs(*args, **kwargs)
+                    res = orig_run(*s_args, **s_kwargs)
+                    if file_path_clean:
+                        from asgiref.sync import async_to_sync
+                        try:
+                            async_to_sync(self.send)(json.dumps({
+                                'type': 'file_event',
+                                'event': 'deleted' if is_delete_tool else 'modified',
+                                'path': file_path_clean
+                            }))
+                        except Exception as e:
+                            print(f"Error sending file_event in wrapped_run: {e}")
+                    return res
+
+                async def wrapped_arun(*args, **kwargs):
+                    s_args, s_kwargs, file_path_clean = sanitize_and_track_inputs(*args, **kwargs)
+                    res = await orig_arun(*s_args, **s_kwargs)
+                    if file_path_clean:
+                        try:
+                            await self.send(json.dumps({
+                                'type': 'file_event',
+                                'event': 'deleted' if is_delete_tool else 'modified',
+                                'path': file_path_clean
+                            }))
+                        except Exception as e:
+                            print(f"Error sending file_event in wrapped_arun: {e}")
+                    return res
+
+                tool._run = wrapped_run
+                tool._arun = wrapped_arun
+                return tool
+
+            # Wrap each tool and store in self.tools
+            for t in base_tools:
+                self.tools.append(wrap_tool(t))
 
             # Initialize Specialized Agents
             # 1. Planner (Simple Chain)
@@ -438,12 +522,13 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
             self.planner_agent = planner_template | self.llm | StrOutputParser()
 
             # 2. Coder (Tool-augmented Agent)
-            # We use create_agent for the Coder as it needs tools
+            # Path sanitization is applied in AgentCallbackHandler.on_agent_action
             self.coder_agent = create_agent(
                 model=self.llm,
                 tools=self.tools,
                 system_prompt=CODER_PROMPT,
             )
+            print(f"Coder agent created: {self.coder_agent is not None}")
 
             # 3. Reviewer (Simple Chain)
             reviewer_template = ChatPromptTemplate.from_messages([
@@ -451,11 +536,12 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
                 ("human", "User Request: {input}\nPlan: {plan}\nActions Done: {actions}"),
             ])
             self.reviewer_agent = reviewer_template | self.llm | StrOutputParser()
-            
-            # Removed hardcoded system ready message
+            print("LangChain agents initialized successfully.")
             
         except Exception as e:
             print(f"Error in LangChainAgentConsumer.connect: {e}")
+            import traceback
+            traceback.print_exc()
             await self.send(text_data=json.dumps({'error': str(e)}))
 
     async def get_history(self):
@@ -490,7 +576,6 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
                 if self.agent_task and not self.agent_task.done():
                     self.agent_task.cancel()
                     self.agent_task = None
-                    # Send an acknowledgement
                     await self.send(text_data=json.dumps({
                         'type': 'final_output',
                         'output': "User stopped agent to work.\n"
@@ -502,6 +587,9 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
             if not user_input: return
 
             print(f"Agent Processing Request: {user_input} (Mode: {mode})")
+            # Reset per-run accumulators
+            self.current_reasoning = ''
+            self.modified_files = set()
             callback = AgentCallbackHandler(self)
             history = await self.get_history()
 
@@ -520,25 +608,30 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
                         
                         await self.send(text_data=json.dumps({
                             'type': 'final_output',
-                            'output': final_response + "\n"
+                            'output': final_response + "\n",
+                            'reasoning': self.current_reasoning,
+                            'files_created': list(self.modified_files),
                         }))
                         
                         await sync_to_async(ChatMessage.objects.create)(
                             project=await sync_to_async(Workspace.objects.get)(workspace_id=self.workspace_id),
                             session=await sync_to_async(ChatSession.objects.get)(id=self.session_id) if self.session_id else None,
                             sender='agent',
-                            text=final_response
+                            text=final_response,
+                            reasoning=self.current_reasoning or None,
+                            files_created=json.dumps(list(self.modified_files)) if self.modified_files else None,
                         )
                         return
 
                     # PHASE 1: PLANNING
                     await self.send(text_data=json.dumps({'type': 'reasoning', 'content': "\n[SYSTEM] Planner is drafting an implementation strategy...\n"}))
                     plan = await self.planner_agent.ainvoke({"input": user_input, "history": history})
-                    await self.send(text_data=json.dumps({'type': 'reasoning', 'content': f"Plan Created:\n{plan}\n"}))
+                    plan_text = f"Plan Created:\n{plan}\n"
+                    self.current_reasoning += plan_text
+                    await self.send(text_data=json.dumps({'type': 'reasoning', 'content': plan_text}))
 
                     # PHASE 2: CODING (Execution)
                     await self.send(text_data=json.dumps({'type': 'reasoning', 'content': "\n[SYSTEM] Coder is executing the plan and managing files...\n"}))
-                    # The coder uses tools, so it will trigger callbacks for file_event and reasoning
                     coder_response = await self.coder_agent.ainvoke(
                         {"messages": [HumanMessage(content=f"User Request: {user_input}\nPlan to execute: {plan}")]},
                         {"callbacks": [callback]}
@@ -559,22 +652,27 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
                         "actions": coder_actions_summary
                     })
 
+                    files_list = list(self.modified_files)
+
                     # Clean up and Send
                     await self.send(text_data=json.dumps({
                         'type': 'final_output',
-                        'output': final_response + "\n"
+                        'output': final_response + "\n",
+                        'reasoning': self.current_reasoning,
+                        'files_created': files_list,
                     }))
 
-                    # Save to History
+                    # Save to History (with reasoning + files)
                     await sync_to_async(ChatMessage.objects.create)(
                         project=await sync_to_async(Workspace.objects.get)(workspace_id=self.workspace_id),
                         session=await sync_to_async(ChatSession.objects.get)(id=self.session_id) if self.session_id else None,
                         sender='agent',
-                        text=final_response
+                        text=final_response,
+                        reasoning=self.current_reasoning or None,
+                        files_created=json.dumps(files_list) if files_list else None,
                     )
                 except asyncio.CancelledError:
                     print("Agent task cancelled by user interrupt.")
-                    # Let the interrupt handler manage the send output
                 except Exception as ex:
                     print(f"Agent execution error: {ex}")
                     await self.send(text_data=json.dumps({'error': str(ex)}))
@@ -589,4 +687,5 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
         except Exception as e:
             print(f"Error in LangChainAgentConsumer.receive: {e}")
             await self.send(text_data=json.dumps({'error': str(e)}))
+
 
