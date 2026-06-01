@@ -469,9 +469,11 @@ class LangChainAgentConsumer(AsyncWebsocketConsumer):
                                 file_path = inp.get("file_path") or inp.get("path")
                         
                         if file_path:
-                            file_path_clean = _sanitize_single_path(file_path, self.work_dir)
-                            print(f"Tool {tool.name} modifying path: {file_path_clean}")
-                            self.modified_files.add(file_path_clean)
+                            candidate = _sanitize_single_path(file_path, self.work_dir)
+                            if candidate not in self.modified_files:
+                                file_path_clean = candidate
+                                print(f"Tool {tool.name} modifying path: {file_path_clean}")
+                                self.modified_files.add(file_path_clean)
                     
                     return sanitized_args, sanitized_kwargs, file_path_clean
 
