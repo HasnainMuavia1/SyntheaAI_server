@@ -21,6 +21,8 @@ class TerminalConsumer(AsyncWebsocketConsumer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pty = None
+        self.fd = None
+        self.pid = None
         self.pty_task = None
 
     async def connect(self):
@@ -28,81 +30,157 @@ class TerminalConsumer(AsyncWebsocketConsumer):
         await self.accept()
         print("Terminal WebSocket accepted.")
 
-        # The interactive terminal relies on winpty (Windows-only). When it is not
-        # available (e.g. running inside a Linux container) we report it instead of
-        # crashing the websocket connection.
-        if not WINPTY_AVAILABLE:
-            await self.send(text_data=json.dumps({
-                'error': 'Terminal feature is unavailable on this platform (requires Windows/winpty).'
-            }))
-            await self.close()
-            return
-
-        # Start a PowerShell/Cmd PTY
+        query = parse_qs(self.scope.get("query_string", b"").decode())
         try:
-            query = parse_qs(self.scope.get("query_string", b"").decode())
-            try:
-                cols = int(query.get("cols", [80])[0])
-                rows = int(query.get("rows", [24])[0])
-            except (ValueError, TypeError):
-                cols = 80
-                rows = 24
-                
-            print(f"Spawning PTY with {cols}x{rows}...")
-            self.pty = PTY(cols, rows)
-            
-            # Spawn PowerShell without PSReadLine.
-            # PSReadLine causes multi-line text redraws in winpty and lacks certain flags
-            # on older Windows PowerShell versions (like PredictionSource).
-            self.pty.spawn(
-                "powershell.exe",
-                cmdline='powershell.exe -NoExit -Command "Remove-Module PSReadLine -ErrorAction SilentlyContinue"'
-            )
-            # Give the shell time to execute its profile + our init command
-            await asyncio.sleep(1.0)
+            cols = int(query.get("cols", [80])[0])
+            rows = int(query.get("rows", [24])[0])
+        except (ValueError, TypeError):
+            cols = 80
+            rows = 24
 
-            # After shell starts, change directory into the requested workspace if provided
+        if WINPTY_AVAILABLE:
+            # Start a PowerShell/Cmd PTY for Windows
             try:
-                query = parse_qs(self.scope.get("query_string", b"").decode())
-                workspace_id = query.get("projectId", [None])[0]
-                if workspace_id:
-                    # Workspace.workspace_id is a UUIDField
-                    workspace = await sync_to_async(Workspace.objects.get)(workspace_id=workspace_id)
-                    # Use forward slashes to avoid PowerShell escape character issues
-                    cwd = workspace.get_absolute_path()
-                    # Use Set-Location with the native Windows path (backslashes).
-                    # Forward slashes can trigger "directory name is invalid" inside winpty PTYs.
-                    self.pty.write('\r\n')
-                    self.pty.write(f'Set-Location "{cwd}"\r\n')
+                print(f"Spawning Windows PTY with {cols}x{rows}...")
+                self.pty = PTY(cols, rows)
+                
+                # Spawn PowerShell without PSReadLine.
+                self.pty.spawn(
+                    "powershell.exe",
+                    cmdline='powershell.exe -NoExit -Command "Remove-Module PSReadLine -ErrorAction SilentlyContinue"'
+                )
+                # Give the shell time to execute its profile + our init command
+                await asyncio.sleep(1.0)
+
+                # After shell starts, change directory into the requested workspace if provided
+                try:
+                    workspace_id = query.get("projectId", [None])[0]
+                    if workspace_id:
+                        workspace = await sync_to_async(Workspace.objects.get)(workspace_id=workspace_id)
+                        cwd = workspace.get_absolute_path()
+                        self.pty.write('\r\n')
+                        self.pty.write(f'Set-Location "{cwd}"\r\n')
+                except Exception as e:
+                    print(f"Failed to change Windows PTY directory: {e}")
+                
+                # Start background task to read from PTY
+                self.pty_task = asyncio.create_task(self.read_from_pty())
             except Exception as e:
-                print(f"Failed to change PTY directory: {e}")
-            
-            # Start background task to read from PTY
-            self.pty_task = asyncio.create_task(self.read_from_pty())
-            
-        except Exception as e:
-            print(f"Error in TerminalConsumer.connect: {e}")
-            await self.send(text_data=json.dumps({'error': str(e)}))
+                print(f"Error in TerminalConsumer.connect (Windows): {e}")
+                await self.send(text_data=json.dumps({'error': str(e)}))
+                await self.close()
+        else:
+            # Unix / Linux / macOS PTY spawning logic
+            try:
+                import pty
+                import termios
+                import fcntl
+                import struct
+            except ImportError as e:
+                print(f"Unix PTY dependencies not available: {e}")
+                await self.send(text_data=json.dumps({
+                    'error': 'Terminal feature is unavailable on this platform (missing Unix pty/termios libs).'
+                }))
+                await self.close()
+                return
+
+            try:
+                print(f"Spawning UNIX PTY with {cols}x{rows}...")
+                pid, fd = pty.fork()
+                if pid == 0:
+                    # CHILD PROCESS (forked)
+                    env = os.environ.copy()
+                    env["TERM"] = "xterm-256color"
+                    env["COLUMNS"] = str(cols)
+                    env["LINES"] = str(rows)
+
+                    workspace_id = query.get("projectId", [None])[0]
+                    cwd = os.getcwd()
+                    if workspace_id:
+                        try:
+                            # Synchronously query since we are in a clean fork
+                            from .models import Workspace
+                            workspace = Workspace.objects.get(workspace_id=workspace_id)
+                            cwd = workspace.get_absolute_path()
+                        except Exception as ex:
+                            print(f"Child process failed to get workspace: {ex}")
+
+                    try:
+                        os.chdir(cwd)
+                    except Exception as ex:
+                        print(f"Child process failed to chdir to {cwd}: {ex}")
+
+                    shell = "/bin/bash"
+                    if not os.path.exists(shell):
+                        shell = "/bin/sh"
+                    
+                    os.execvpe(shell, [shell], env)
+                else:
+                    # PARENT PROCESS
+                    self.fd = fd
+                    self.pid = pid
+                    
+                    # Set terminal size
+                    try:
+                        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+                    except Exception as e:
+                        print(f"Failed to set initial terminal size: {e}")
+
+                    # Start PTY read loop task
+                    self.pty_task = asyncio.create_task(self.read_from_pty())
+            except Exception as e:
+                print(f"Error spawning Unix terminal: {e}")
+                await self.send(text_data=json.dumps({'error': str(e)}))
+                await self.close()
 
     async def disconnect(self, close_code):
         if self.pty_task:
             self.pty_task.cancel()
-        if self.pty:
-            del self.pty
+        if WINPTY_AVAILABLE:
+            if self.pty:
+                del self.pty
+        else:
+            if self.fd is not None:
+                try:
+                    os.close(self.fd)
+                except:
+                    pass
+            if self.pid is not None:
+                try:
+                    import signal
+                    os.kill(self.pid, signal.SIGKILL)
+                    os.waitpid(self.pid, os.WNOHANG)
+                except:
+                    pass
 
     async def receive(self, text_data):
-        if not self.pty:
-            return
-            
         try:
             text_data_json = json.loads(text_data)
             command = text_data_json.get('command')
             resize = text_data_json.get('resize')
             
             if command:
-                self.pty.write(command)
+                if WINPTY_AVAILABLE:
+                    if self.pty:
+                        self.pty.write(command)
+                else:
+                    if self.fd is not None:
+                        await asyncio.to_thread(os.write, self.fd, command.encode())
             elif resize:
-                self.pty.set_size(resize['cols'], resize['rows'])
+                if WINPTY_AVAILABLE:
+                    if self.pty:
+                        self.pty.set_size(resize['cols'], resize['rows'])
+                else:
+                    if self.fd is not None:
+                        import fcntl
+                        import termios
+                        import struct
+                        try:
+                            winsize = struct.pack("HHHH", resize['rows'], resize['cols'], 0, 0)
+                            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, winsize)
+                        except Exception as e:
+                            print(f"Failed to resize Unix terminal: {e}")
         except Exception as e:
             print(f"Error handling receive: {e}")
 
@@ -110,17 +188,30 @@ class TerminalConsumer(AsyncWebsocketConsumer):
         print("Starting PTY read loop...")
         try:
             while True:
-                # pywinpty read is blocking, run in executor.
-                # Newer pywinpty PTY.read signature takes at most one optional size argument.
-                # Rely on its internal blocking behavior and default buffer size.
-                output = await asyncio.to_thread(self.pty.read)
-                if output:
-                    # print(f"PTY Output: {output}")
-                    await self.send(text_data=json.dumps({
-                        'output': output
-                    }))
+                if WINPTY_AVAILABLE:
+                    if not self.pty:
+                        break
+                    output = await asyncio.to_thread(self.pty.read)
+                    if output:
+                        await self.send(text_data=json.dumps({
+                            'output': output
+                        }))
+                    else:
+                        await asyncio.sleep(0.01)
                 else:
-                    await asyncio.sleep(0.01)
+                    if self.fd is None:
+                        break
+                    # Use asyncio.to_thread to prevent blocking the event loop on os.read
+                    data = await asyncio.to_thread(os.read, self.fd, 1024)
+                    if not data:
+                        # EOF from shell
+                        break
+                    # Decode text safely, handling partial UTF-8 sequences
+                    output = data.decode('utf-8', errors='ignore')
+                    if output:
+                        await self.send(text_data=json.dumps({
+                            'output': output
+                        }))
         except asyncio.CancelledError:
             print("PTY read loop cancelled.")
         except Exception as e:
